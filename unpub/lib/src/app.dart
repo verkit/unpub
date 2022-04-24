@@ -1,28 +1,32 @@
 import 'dart:convert';
 import 'dart:io';
+
+import 'package:archive/archive.dart';
 import 'package:collection/collection.dart' show IterableExtension;
-import 'package:shelf/shelf.dart' as shelf;
-import 'package:shelf/shelf_io.dart' as shelf_io;
+import 'package:googleapis/oauth2/v2.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/io_client.dart';
-import 'package:googleapis/oauth2/v2.dart';
-import 'package:mime/mime.dart';
 import 'package:http_parser/http_parser.dart';
+import 'package:mime/mime.dart';
+import 'package:pub_semver/pub_semver.dart' as semver;
+import 'package:shelf/shelf.dart' as shelf;
+import 'package:shelf/shelf_io.dart' as shelf_io;
 import 'package:shelf_cors_headers/shelf_cors_headers.dart';
 import 'package:shelf_router/shelf_router.dart';
-import 'package:pub_semver/pub_semver.dart' as semver;
-import 'package:archive/archive.dart';
-import 'package:unpub/src/models.dart';
-import 'package:unpub/unpub_api/lib/models.dart';
 import 'package:unpub/src/meta_store.dart';
+import 'package:unpub/src/models.dart';
 import 'package:unpub/src/package_store.dart';
-import 'utils.dart';
+import 'package:unpub/unpub_api/lib/models.dart';
+
 import 'static/index.html.dart' as index_html;
 import 'static/main.dart.js.dart' as main_dart_js;
+import 'utils.dart';
 
 part 'app.g.dart';
 
 class App {
+  static const proxyOriginHeader = "proxy-origin";
+
   /// meta information store
   final MetaStore metaStore;
 
@@ -36,11 +40,13 @@ class App {
   final String? googleapisProxy;
   final String? overrideUploaderEmail;
 
+  /// A forward proxy uri
+  final Uri? proxy_origin;
+
   /// validate if the package can be published
   ///
   /// for more details, see: https://github.com/bytedance/unpub#package-validator
-  final Future<void> Function(
-      Map<String, dynamic> pubspec, String uploaderEmail)? uploadValidator;
+  final Future<void> Function(Map<String, dynamic> pubspec, String uploaderEmail)? uploadValidator;
 
   App({
     required this.metaStore,
@@ -49,24 +55,19 @@ class App {
     this.googleapisProxy,
     this.overrideUploaderEmail,
     this.uploadValidator,
+    this.proxy_origin,
   });
 
-  static shelf.Response _okWithJson(Map<String, dynamic> data) =>
-      shelf.Response.ok(
+  static shelf.Response _okWithJson(Map<String, dynamic> data) => shelf.Response.ok(
         json.encode(data),
-        headers: {
-          HttpHeaders.contentTypeHeader: ContentType.json.mimeType,
-          'Access-Control-Allow-Origin': '*'
-        },
+        headers: {HttpHeaders.contentTypeHeader: ContentType.json.mimeType, 'Access-Control-Allow-Origin': '*'},
       );
 
   static shelf.Response _successMessage(String message) => _okWithJson({
         'success': {'message': message}
       });
 
-  static shelf.Response _badRequest(String message,
-          {int status = HttpStatus.badRequest}) =>
-      shelf.Response(
+  static shelf.Response _badRequest(String message, {int status = HttpStatus.badRequest}) => shelf.Response(
         status,
         headers: {HttpHeaders.contentTypeHeader: ContentType.json.mimeType},
         body: json.encode({
@@ -75,6 +76,17 @@ class App {
       );
 
   http.Client? _googleapisClient;
+
+  String _resolveUrl(shelf.Request req, String reference) {
+    if (proxy_origin != null) {
+      return proxy_origin!.resolve(reference).toString();
+    }
+    String? proxyOriginInHeader = req.headers[proxyOriginHeader];
+    if (proxyOriginInHeader != null) {
+      return Uri.parse(proxyOriginInHeader).resolve(reference).toString();
+    }
+    return req.requestedUri.resolve(reference).toString();
+  }
 
   Future<String> _getUploaderEmail(shelf.Request req) async {
     if (overrideUploaderEmail != null) return overrideUploaderEmail!;
@@ -87,24 +99,21 @@ class App {
     if (_googleapisClient == null) {
       if (googleapisProxy != null) {
         _googleapisClient = IOClient(HttpClient()
-          ..findProxy = (url) => HttpClient.findProxyFromEnvironment(url,
-              environment: {"https_proxy": googleapisProxy!}));
+          ..findProxy =
+              (url) => HttpClient.findProxyFromEnvironment(url, environment: {"https_proxy": googleapisProxy!}));
       } else {
         _googleapisClient = http.Client();
       }
     }
 
-    var info =
-        await Oauth2Api(_googleapisClient!).tokeninfo(accessToken: token);
+    var info = await Oauth2Api(_googleapisClient!).tokeninfo(accessToken: token);
     if (info.email == null) throw 'fail to get google account email';
     return info.email!;
   }
 
   Future<HttpServer> serve([String? host = '0.0.0.0', int port = 4000]) async {
-    var handler = const shelf.Pipeline()
-        .addMiddleware(corsHeaders())
-        .addMiddleware(shelf.logRequests())
-        .addHandler((req) async {
+    var handler =
+        const shelf.Pipeline().addMiddleware(corsHeaders()).addMiddleware(shelf.logRequests()).addHandler((req) async {
       // Return 404 by default
       // https://github.com/google/dart-neats/issues/1
       var res = await router.call(req);
@@ -114,13 +123,11 @@ class App {
     return server;
   }
 
-  Map<String, dynamic> _versionToJson(UnpubVersion item, Uri baseUri) {
+  Map<String, dynamic> _versionToJson(UnpubVersion item, shelf.Request req) {
     var name = item.pubspec['name'] as String;
     var version = item.version;
     return {
-      'archive_url': baseUri
-          .resolve('/packages/$name/versions/$version.tar.gz')
-          .toString(),
+      'archive_url': _resolveUrl(req, '/packages/$name/versions/$version.tar.gz'),
       'pubspec': item.pubspec,
       'version': version,
     };
@@ -139,18 +146,14 @@ class App {
     var package = await metaStore.queryPackage(name);
 
     if (package == null) {
-      return shelf.Response.found(
-          Uri.parse(upstream).resolve('/api/packages/$name').toString());
+      return shelf.Response.found(Uri.parse(upstream).resolve('/api/packages/$name').toString());
     }
 
     package.versions.sort((a, b) {
-      return semver.Version.prioritize(
-          semver.Version.parse(a.version), semver.Version.parse(b.version));
+      return semver.Version.prioritize(semver.Version.parse(a.version), semver.Version.parse(b.version));
     });
 
-    var versionMaps = package.versions
-        .map((item) => _versionToJson(item, req.requestedUri))
-        .toList();
+    var versionMaps = package.versions.map((item) => _versionToJson(item, req)).toList();
 
     return _okWithJson({
       'name': name,
@@ -160,8 +163,7 @@ class App {
   }
 
   @Route.get('/api/packages/<name>/versions/<version>')
-  Future<shelf.Response> getVersion(
-      shelf.Request req, String name, String version) async {
+  Future<shelf.Response> getVersion(shelf.Request req, String name, String version) async {
     // Important: + -> %2B, should be decoded here
     try {
       version = Uri.decodeComponent(version);
@@ -171,28 +173,22 @@ class App {
 
     var package = await metaStore.queryPackage(name);
     if (package == null) {
-      return shelf.Response.found(Uri.parse(upstream)
-          .resolve('/api/packages/$name/versions/$version')
-          .toString());
+      return shelf.Response.found(Uri.parse(upstream).resolve('/api/packages/$name/versions/$version').toString());
     }
 
-    var packageVersion =
-        package.versions.firstWhereOrNull((item) => item.version == version);
+    var packageVersion = package.versions.firstWhereOrNull((item) => item.version == version);
     if (packageVersion == null) {
       return shelf.Response.notFound('Not Found');
     }
 
-    return _okWithJson(_versionToJson(packageVersion, req.requestedUri));
+    return _okWithJson(_versionToJson(packageVersion, req));
   }
 
   @Route.get('/packages/<name>/versions/<version>.tar.gz')
-  Future<shelf.Response> download(
-      shelf.Request req, String name, String version) async {
+  Future<shelf.Response> download(shelf.Request req, String name, String version) async {
     var package = await metaStore.queryPackage(name);
     if (package == null) {
-      return shelf.Response.found(Uri.parse(upstream)
-          .resolve('/packages/$name/versions/$version.tar.gz')
-          .toString());
+      return shelf.Response.found(Uri.parse(upstream).resolve('/packages/$name/versions/$version.tar.gz').toString());
     }
 
     if (isPubClient(req)) {
@@ -212,9 +208,7 @@ class App {
   @Route.get('/api/packages/versions/new')
   Future<shelf.Response> getUploadUrl(shelf.Request req) async {
     return _okWithJson({
-      'url': req.requestedUri
-          .resolve('/api/packages/versions/newUpload')
-          .toString(),
+      'url': _resolveUrl(req, '/api/packages/versions/newUpload').toString(),
       'fields': {},
     });
   }
@@ -242,8 +236,7 @@ class App {
         fileData = part;
       }
 
-      var bb = await fileData!.fold(
-          BytesBuilder(), (BytesBuilder byteBuilder, d) => byteBuilder..add(d));
+      var bb = await fileData!.fold(BytesBuilder(), (BytesBuilder byteBuilder, d) => byteBuilder..add(d));
       var tarballBytes = bb.takeBytes();
       var tarBytes = GZipDecoder().decodeBytes(tarballBytes);
       var archive = TarDecoder().decodeBytes(tarBytes);
@@ -295,8 +288,7 @@ class App {
         }
 
         // Check duplicated version
-        var duplicated = package.versions
-            .firstWhereOrNull((item) => version == item.version);
+        var duplicated = package.versions.firstWhereOrNull((item) => version == item.version);
         if (duplicated != null) {
           throw 'version invalid: $name@$version already exists.';
         }
@@ -327,12 +319,9 @@ class App {
       await metaStore.addVersion(name, unpubVersion);
 
       // TODO: Upload docs
-      return shelf.Response.found(req.requestedUri
-          .resolve('/api/packages/versions/newUploadFinish')
-          .toString());
+      return shelf.Response.found(_resolveUrl(req, '/api/packages/versions/newUploadFinish'));
     } catch (err) {
-      return shelf.Response.found(req.requestedUri
-          .resolve('/api/packages/versions/newUploadFinish?error=$err'));
+      return shelf.Response.found(_resolveUrl(req, '/api/packages/versions/newUploadFinish?error=$err'));
     }
   }
 
@@ -364,8 +353,7 @@ class App {
   }
 
   @Route.delete('/api/packages/<name>/uploaders/<email>')
-  Future<shelf.Response> removeUploader(
-      shelf.Request req, String name, String email) async {
+  Future<shelf.Response> removeUploader(shelf.Request req, String name, String email) async {
     email = Uri.decodeComponent(email);
     var operatorEmail = await _getUploaderEmail(req);
     var package = await metaStore.queryPackage(name);
@@ -427,8 +415,7 @@ class App {
   }
 
   @Route.get('/webapi/package/<name>/<version>')
-  Future<shelf.Response> getPackageDetail(
-      shelf.Request req, String name, String version) async {
+  Future<shelf.Response> getPackageDetail(shelf.Request req, String name, String version) async {
     var package = await metaStore.queryPackage(name);
     if (package == null) {
       return _okWithJson({'error': 'package not exists'});
@@ -438,32 +425,23 @@ class App {
     if (version == 'latest') {
       packageVersion = package.versions.last;
     } else {
-      packageVersion =
-          package.versions.firstWhereOrNull((item) => item.version == version);
+      packageVersion = package.versions.firstWhereOrNull((item) => item.version == version);
     }
     if (packageVersion == null) {
       return _okWithJson({'error': 'version not exists'});
     }
 
-    var versions = package.versions
-        .map((v) => DetailViewVersion(v.version, v.createdAt))
-        .toList();
+    var versions = package.versions.map((v) => DetailViewVersion(v.version, v.createdAt)).toList();
     versions.sort((a, b) {
-      return semver.Version.prioritize(
-          semver.Version.parse(b.version), semver.Version.parse(a.version));
+      return semver.Version.prioritize(semver.Version.parse(b.version), semver.Version.parse(a.version));
     });
 
     var pubspec = packageVersion.pubspec;
     List<String?> authors;
     if (pubspec['author'] != null) {
-      authors = RegExp(r'<(.*?)>')
-          .allMatches(pubspec['author'])
-          .map((match) => match.group(1))
-          .toList();
+      authors = RegExp(r'<(.*?)>').allMatches(pubspec['author']).map((match) => match.group(1)).toList();
     } else if (pubspec['authors'] != null) {
-      authors = (pubspec['authors'] as List)
-          .map((author) => RegExp(r'<(.*?)>').firstMatch(author)!.group(1))
-          .toList();
+      authors = (pubspec['authors'] as List).map((author) => RegExp(r'<(.*?)>').firstMatch(author)!.group(1)).toList();
     } else {
       authors = [];
     }
@@ -493,34 +471,26 @@ class App {
   @Route.get('/packages/<name>')
   @Route.get('/packages/<name>/versions/<version>')
   Future<shelf.Response> indexHtml(shelf.Request req) async {
-    return shelf.Response.ok(index_html.content,
-        headers: {HttpHeaders.contentTypeHeader: ContentType.html.mimeType});
+    return shelf.Response.ok(index_html.content, headers: {HttpHeaders.contentTypeHeader: ContentType.html.mimeType});
   }
 
   @Route.get('/main.dart.js')
   Future<shelf.Response> mainDartJs(shelf.Request req) async {
-    return shelf.Response.ok(main_dart_js.content,
-        headers: {HttpHeaders.contentTypeHeader: 'text/javascript'});
+    return shelf.Response.ok(main_dart_js.content, headers: {HttpHeaders.contentTypeHeader: 'text/javascript'});
   }
 
-  String _getBadgeUrl(String label, String message, String color,
-      Map<String, String> queryParameters) {
+  String _getBadgeUrl(String label, String message, String color, Map<String, String> queryParameters) {
     var badgeUri = Uri.parse('https://img.shields.io/static/v1');
-    return Uri(
-        scheme: badgeUri.scheme,
-        host: badgeUri.host,
-        path: badgeUri.path,
-        queryParameters: {
-          'label': label,
-          'message': message,
-          'color': color,
-          ...queryParameters,
-        }).toString();
+    return Uri(scheme: badgeUri.scheme, host: badgeUri.host, path: badgeUri.path, queryParameters: {
+      'label': label,
+      'message': message,
+      'color': color,
+      ...queryParameters,
+    }).toString();
   }
 
   @Route.get('/badge/<type>/<name>')
-  Future<shelf.Response> badge(
-      shelf.Request req, String type, String name) async {
+  Future<shelf.Response> badge(shelf.Request req, String type, String name) async {
     var queryParameters = req.requestedUri.queryParameters;
     var package = await metaStore.queryPackage(name);
     if (package == null) {
@@ -529,17 +499,13 @@ class App {
 
     switch (type) {
       case 'v':
-        var latest = semver.Version.primary(package.versions
-            .map((pv) => semver.Version.parse(pv.version))
-            .toList());
+        var latest = semver.Version.primary(package.versions.map((pv) => semver.Version.parse(pv.version)).toList());
 
         var color = latest.major == 0 ? 'orange' : 'blue';
 
-        return shelf.Response.found(
-            _getBadgeUrl('unpub', latest.toString(), color, queryParameters));
+        return shelf.Response.found(_getBadgeUrl('unpub', latest.toString(), color, queryParameters));
       case 'd':
-        return shelf.Response.found(_getBadgeUrl(
-            'downloads', package.download.toString(), 'blue', queryParameters));
+        return shelf.Response.found(_getBadgeUrl('downloads', package.download.toString(), 'blue', queryParameters));
       default:
         return shelf.Response.notFound('Not found');
     }
