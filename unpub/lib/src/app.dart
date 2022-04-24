@@ -111,7 +111,7 @@ class App {
     return info.email!;
   }
 
-  Future<HttpServer> serve([String? host = '0.0.0.0', int port = 4000]) async {
+  Future<HttpServer> serve(String host, int port) async {
     var handler =
         const shelf.Pipeline().addMiddleware(corsHeaders()).addMiddleware(shelf.logRequests()).addHandler((req) async {
       // Return 404 by default
@@ -119,7 +119,7 @@ class App {
       var res = await router.call(req);
       return res;
     });
-    var server = await shelf_io.serve(handler, host, port);
+    var server = await shelf_io.serve(handler, 'localhost', port);
     return server;
   }
 

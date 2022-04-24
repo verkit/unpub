@@ -7,14 +7,14 @@ import 'package:unpub/unpub.dart' as unpub;
 
 main(List<String> args) async {
   var parser = ArgParser();
-  parser.addOption('host', abbr: 'h', defaultsTo: '0.0.0.0');
+  parser.addOption('host', abbr: 'h', defaultsTo: '127.0.0.1');
   parser.addOption('port', abbr: 'p', defaultsTo: '4000');
   parser.addOption('database', abbr: 'd', defaultsTo: 'mongodb://localhost:27017/dart_pub');
   parser.addOption('proxy-origin', abbr: 'o', defaultsTo: '');
 
   var results = parser.parse(args);
 
-  var host = results['host'] as String?;
+  var host = results['host'] as String;
   var port = int.parse(results['port'] as String);
   var dbUri = results['database'] as String;
   var proxy_origin = results['proxy-origin'] as String;
