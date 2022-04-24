@@ -1,38 +1,46 @@
-import 'dart:io';
-import 'package:path/path.dart' as path;
-import 'package:args/args.dart';
 import 'package:mongo_dart/mongo_dart.dart';
 import 'package:unpub/unpub.dart' as unpub;
 
 main(List<String> args) async {
-  var parser = ArgParser();
-  parser.addOption('host', abbr: 'h', defaultsTo: '0.0.0.0');
-  parser.addOption('port', abbr: 'p', defaultsTo: '4000');
-  parser.addOption('database',
-      abbr: 'd', defaultsTo: 'mongodb://localhost:27017/dart_pub');
+  // var parser = ArgParser();
+  // parser.addOption('host', abbr: 'h', defaultsTo: '0.0.0.0');
+  // parser.addOption('port', abbr: 'p', defaultsTo: '4000');
+  // parser.addOption('database',
+  //     abbr: 'd', defaultsTo: 'mongodb://localhost:27017/dart_pub');
 
-  var results = parser.parse(args);
+  // var results = parser.parse(args);
 
-  var host = results['host'] as String?;
-  var port = int.parse(results['port'] as String);
-  var dbUri = results['database'] as String;
+  // var host = results['host'] as String?;
+  // var port = int.parse(results['port'] as String);
+  // var dbUri = results['database'] as String;
 
-  if (results.rest.isNotEmpty) {
-    print('Got unexpected arguments: "${results.rest.join(' ')}".\n\nUsage:\n');
-    print(parser.usage);
-    exit(1);
-  }
+  // if (results.rest.isNotEmpty) {
+  //   print('Got unexpected arguments: "${results.rest.join(' ')}".\n\nUsage:\n');
+  //   print(parser.usage);
+  //   exit(1);
+  // }
 
-  final db = Db(dbUri);
-  await db.open();
+  // final db = Db(dbUri);
+  // await db.open();
 
-  var baseDir = path.absolute('unpub-packages');
+  // var baseDir = path.absolute('unpub-packages');
 
-  var app = unpub.App(
+  // var app = unpub.App(
+  //   metaStore: unpub.MongoStore(db),
+  //   packageStore: unpub.FileStore(baseDir),
+  // );
+
+  // var server = await app.serve(host, port);
+  // print('Serving at http://${server.address.host}:${server.port}');
+
+  final db = Db('mongodb://localhost:27017/dart_pub');
+  await db.open(); // make sure the MongoDB connection opened
+
+  final app = unpub.App(
     metaStore: unpub.MongoStore(db),
-    packageStore: unpub.FileStore(baseDir),
+    packageStore: unpub.FileStore('./unpub-packages'),
   );
 
-  var server = await app.serve(host, port);
+  final server = await app.serve('0.0.0.0', 4000);
   print('Serving at http://${server.address.host}:${server.port}');
 }
